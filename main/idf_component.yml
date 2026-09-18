@@ -2,3 +2,4 @@ dependencies:
   idf: ">=5.4"
   m5stack/m5unified: "*"
   espressif/usb_host_uvc: "^2"
+  espressif/esp-dl: "^3.3"

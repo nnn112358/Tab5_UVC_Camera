@@ -1,10 +1,10 @@
 # Tab5_UVC_Camera
 
-M5Stack Tab5 (ESP32-P4) の USB-A ポートに接続した UVC カメラの映像を、M5Unified で画面に表示する ESP-IDF プロジェクトです。
+M5Stack Tab5 (ESP32-P4) の USB-A ポートに接続した UVC カメラの映像を M5Unified で画面に表示し、超軽量人物検出モデル UHD (UltraTinyOD) で人物を検出して枠を描く ESP-IDF プロジェクトです。
 
 - 著者: **nnn112358**
 - 動作確認: M5Stack Tab5 (ESP32-P4 rev v1.0) + ESP-IDF v5.5 + USB HS カメラ (MJPEG)
-- 実測: 640x480 MJPEG を 30 fps で表示 (デコード 4 ms + 回転/拡大 19 ms / フレーム)
+- 実測: 640x480 MJPEG を 26 fps で表示 (デコード 4 ms + 回転/拡大 22 ms / フレーム)、人物検出は別タスクで約 20 ms / 回 (前処理 1 ms + 推論 18 ms + 後処理 0.5 ms)
 
 ## 特徴
 
@@ -15,6 +15,7 @@ M5Stack Tab5 (ESP32-P4) の USB-A ポートに接続した UVC カメラの映�
 | 回転・拡大 | ESP32-P4 PPA (`esp_driver_ppa`) で時計回り 90 度 + 画面フィット |
 | 表示 | M5GFX (Panel_DSI) のフレームバッファへ PPA が直接書き込み。文字は `M5.Display` で上書き |
 | USB-A 5V 給電 | `M5.Power.setExtOutput(true, m5::ext_USB)` |
+| 人物検出 | [UHD (UltraTinyOD)](https://github.com/PINTO0309/UHD) の ESP-DL 量子化モデル (INT8, 入力 64x64) を `espressif/esp-dl` 3.3 で推論 |
 | 再接続 | カメラの抜き差しを検出して自動で再オープン |
 | フォールバック | MJPEG が無いカメラは YUY2 をソフトウェア変換 |
 
@@ -28,6 +29,11 @@ M5Stack Tab5 (ESP32-P4) の USB-A ポートに接続した UVC カメラの映�
 
 - `m5stack/m5unified`
 - `espressif/usb_host_uvc`
+- `espressif/esp-dl`
+
+モデルファイル `main/models/uhd_w32.espdl` は
+[UHD リリース](https://github.com/PINTO0309/UHD/releases/download/onnx/ultratinyod_anc8_w32_64x64_opencv_inter_nearest_static_nopost.tar.gz)
+の `ultratinyod_anc8_w32_64x64_opencv_inter_nearest_static_nopost.espdl` を改名したもので、ビルド時にバイナリへ埋め込まれます。
 
 ## ビルドと書き込み
 
@@ -65,6 +71,9 @@ esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 460800 write_flash 0x0 Tab5_UVC_Cam
 | `SHOW_FPS` | 1 | 左上に解像度と fps を表示 |
 | `LANDSCAPE_ROTATION` | `PPA_SRM_ROTATION_ANGLE_270` | 表示の向き。`_90` にすると上下逆 |
 | `SELF_TEST` | 0 | 1 で起動時に JPEG 色順と PPA 回転方向をシリアルログで自己診断 |
+| `ENABLE_DETECT` | 1 | 人物検出を有効化 |
+| `DETECT_SCORE_THR` | 0.15 | 検出スコアしきい値 (誤検出が多い場合は上げる) |
+| `DETECT_NMS_THR` / `DETECT_TOP_K` | 0.45 / 10 | NMS しきい値と最大検出数 |
 
 ## 処理の流れ
 
@@ -72,8 +81,10 @@ esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 460800 write_flash 0x0 Tab5_UVC_Cam
 2. `usb_host_uvc` の接続イベントで対応フォーマット一覧を取得し、解像度を選択
 3. 受信フレームをキュー経由で処理タスク (Core 1) へ渡す
 4. ハードウェア JPEG デコーダで RGB565 に展開
-5. PPA で回転 + 拡大し、DSI フレームバッファへ直接書き込み
-6. 切断イベントでストリームを閉じ、再接続を待つ
+5. デコード結果を検出タスク (Core 0) にコピーして UHD を実行 (前フレームの処理中なら読み飛ばす)
+6. PPA で回転 + 拡大し、DSI フレームバッファへ直接書き込み
+7. 最新の検出枠とスコアを `M5.Display` で上書き描画
+8. 切断イベントでストリームを閉じ、再接続を待つ
 
 ## 設計メモ
 
@@ -81,6 +92,8 @@ esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 460800 write_flash 0x0 Tab5_UVC_Cam
 - **色順**: ハードウェア JPEG デコーダの `JPEG_DEC_RGB_ELEMENT_ORDER_BGR` はリトルエンディアン RGB565 (uint16 = RRRRRGGGGGGBBBBB) を出力します。`M5.Display.setSwapBytes(true)` を設定しているので、`pushImage(uint16_t*)` にこの形式をそのまま渡せます。
 - **フレームバッファ**: `Panel_DSI::config_detail().buffer` で取得できます (`buffer_length` は 0 のままなのでパネル寸法から計算)。
 - **JPEG デコーダの入力**: DMA がフラッシュ (rodata) を読めないため、入力データは RAM に置く必要があります。
+- **人物検出**: `main/uhd_detect.cpp` は PINTO0309 氏の esp-who サンプル (`components/uhd_detect`) を esp-dl 3.3 の API に合わせて移植したものです。モデル入力は RGB565LE の 640x480 をそのまま渡し、ESP-DL の前処理で 64x64 にリサイズしています。検出座標は元フレーム座標なので、PPA の拡大率とオフセットで画面座標に変換して描画します。
+- **モデルのターゲット**: 配布されている `.espdl` は ESP32-S3 向けにエクスポートされたものですが、ESP32-P4 でそのまま読み込み・推論できました (推論 18 ms)。
 
 ## sdkconfig の注意点
 
@@ -93,5 +106,7 @@ esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 460800 write_flash 0x0 Tab5_UVC_Cam
 ## 参考
 
 - [Hiroki-Kawakami/Tab5-UVC-Display](https://github.com/Hiroki-Kawakami/Tab5-UVC-Display)
+- [PINTO0309/UHD](https://github.com/PINTO0309/UHD) (人物検出モデル) / [PINTO0309/esp-who ultra_lightweight_human_detection](https://github.com/PINTO0309/esp-who/tree/custom/examples/ultra_lightweight_human_detection)
+- [espressif/esp-dl](https://github.com/espressif/esp-dl)
 - [espressif/usb_host_uvc](https://components.espressif.com/components/espressif/usb_host_uvc)
 - [M5Unified](https://github.com/m5stack/M5Unified) / [M5GFX](https://github.com/m5stack/M5GFX)
