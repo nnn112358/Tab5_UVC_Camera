@@ -1,0 +1,4 @@
+dependencies:
+  idf: ">=5.4"
+  m5stack/m5unified: "*"
+  espressif/usb_host_uvc: "^2"
