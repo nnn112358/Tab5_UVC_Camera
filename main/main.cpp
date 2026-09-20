@@ -33,9 +33,6 @@
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
 #include "lgfx/v1/platforms/esp32p4/Panel_DSI.hpp"
-#include "uhd_detect.hpp"
-
-#include <vector>
 
 static const char *TAG = "tab5_uvc";
 
@@ -49,11 +46,6 @@ static const char *TAG = "tab5_uvc";
 #define FIT_TO_SCREEN       1           // 1: 画面に合わせて拡大 (アスペクト維持), 0: 等倍で中央表示
 #define SHOW_FPS            1           // 1: 左上に fps を表示
 #define NUM_FRAME_BUFFERS   3           // UVC ドライバが持つフレームバッファ数
-#define SELF_TEST           0           // 1: 起動時に JPEG 色順 / PPA 回転方向の自己診断ログを出す
-#define ENABLE_DETECT       1           // 1: UHD (超軽量人物検出) をカメラ画像に適用して枠を描く
-#define DETECT_SCORE_THR    0.15f       // 検出スコアしきい値
-#define DETECT_NMS_THR      0.45f
-#define DETECT_TOP_K        10
 
 // パネル (縦向き) の物理サイズ
 #define PANEL_W             720
@@ -89,21 +81,6 @@ static uint8_t  *s_fb            = nullptr;  // M5GFX (DSI) のフレームバ�
 static size_t    s_fb_size       = 0;
 
 static int64_t s_t_decode = 0, s_t_ppa = 0, s_t_push = 0;   // 計測用 (us 累積)
-
-// ---- 物体検出 (UHD) ----
-struct det_box_t {
-    int x1, y1, x2, y2;     // 元フレーム座標
-    float score;
-};
-static uhd_detect::UltraLightweightHumanDetect *s_detector = nullptr;
-static uint8_t          *s_det_buf      = nullptr;   // 検出用のフレームコピー (RGB565LE)
-static int               s_det_w = 0, s_det_h = 0;
-static SemaphoreHandle_t s_det_req_sem  = nullptr;   // 検出要求
-static SemaphoreHandle_t s_det_mutex    = nullptr;   // s_det_boxes の保護
-static volatile bool     s_det_busy     = false;
-static std::vector<det_box_t> s_det_boxes;
-static float             s_det_ms       = 0;         // 直近の検出所要時間 (前処理+推論+後処理)
-static void draw_detections(int w, int h, int bx, int by, int bw, int bh);
 
 // ---------------------------------------------------------------------------
 // USB ホストライブラリのイベント処理タスク
@@ -313,10 +290,6 @@ static void draw_frame(const uint8_t *rgb, int w, int h)
         s_t_push += esp_timer_get_time() - t1;
     }
 
-#if ENABLE_DETECT
-    draw_detections(w, h, bx, by, bw, bh);
-#endif
-
 #if SHOW_FPS
     static uint32_t frames = 0;
     static uint32_t last_ms = 0;
@@ -356,101 +329,6 @@ static void show_message(const char *msg)
 }
 
 // ---------------------------------------------------------------------------
-// 物体検出タスク: 表示とは別に、最新フレームのコピーに対して UHD を実行
-// ---------------------------------------------------------------------------
-#if ENABLE_DETECT
-static void detect_task(void *arg)
-{
-    while (true) {
-        xSemaphoreTake(s_det_req_sem, portMAX_DELAY);
-        dl::image::img_t img = {
-            .data     = s_det_buf,
-            .width    = (uint16_t)s_det_w,
-            .height   = (uint16_t)s_det_h,
-            .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565LE,
-        };
-        auto &res = s_detector->run(img);
-
-        xSemaphoreTake(s_det_mutex, portMAX_DELAY);
-        s_det_boxes.clear();
-        for (auto &r : res) {
-            s_det_boxes.push_back({r.box[0], r.box[1], r.box[2], r.box[3], r.score});
-        }
-        s_det_ms = s_detector->last_pre_ms + s_detector->last_infer_ms + s_detector->last_post_ms;
-        xSemaphoreGive(s_det_mutex);
-
-        static uint32_t last_log = 0;
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (now - last_log >= 1000) {
-            last_log = now;
-            ESP_LOGI(TAG, "detect: %u box(es)  pre %.1f ms, infer %.1f ms, post %.1f ms",
-                     (unsigned)s_det_boxes.size(), s_detector->last_pre_ms, s_detector->last_infer_ms,
-                     s_detector->last_post_ms);
-            for (auto &b : s_det_boxes) {
-                ESP_LOGI(TAG, "  box (%d,%d)-(%d,%d) score %.2f", b.x1, b.y1, b.x2, b.y2, b.score);
-            }
-        }
-        s_det_busy = false;
-    }
-}
-
-// 検出タスクが空いていればフレームをコピーして検出を依頼する
-static void request_detect(const uint8_t *rgb, int w, int h)
-{
-    if (!s_detector || s_det_busy) {
-        return;
-    }
-    size_t bytes = (size_t)w * h * 2;
-    if (bytes > (size_t)MAX_FRAME_W * MAX_FRAME_H * 2) {
-        return;
-    }
-    memcpy(s_det_buf, rgb, bytes);
-    s_det_w = w;
-    s_det_h = h;
-    s_det_busy = true;
-    xSemaphoreGive(s_det_req_sem);
-}
-
-// 検出枠を横向き座標で描く。frame (w x h) は縦向きパネル上のブロック (bx,by,bw,bh) に置かれている
-static void draw_detections(int w, int h, int bx, int by, int bw, int bh)
-{
-    std::vector<det_box_t> boxes;
-    float det_ms;
-    xSemaphoreTake(s_det_mutex, portMAX_DELAY);
-    boxes  = s_det_boxes;
-    det_ms = s_det_ms;
-    xSemaphoreGive(s_det_mutex);
-
-    auto &disp = M5.Display;
-    // 横向き (setRotation(1)) の論理座標 (X,Y) はパネル座標 (719-Y, X) に対応する
-    const float sx = (float)bh / w;                 // フレーム x → 横向き X の倍率
-    const float sy = (float)bw / h;                 // フレーム y → 横向き Y の倍率
-    const int   lx = by;                            // ブロック左上の横向き X
-    const int   ly = PANEL_W - bx - bw;             // ブロック左上の横向き Y
-
-    disp.startWrite();
-    disp.setRotation(1);
-    for (auto &b : boxes) {
-        int X1 = lx + (int)(b.x1 * sx), Y1 = ly + (int)(b.y1 * sy);
-        int X2 = lx + (int)(b.x2 * sx), Y2 = ly + (int)(b.y2 * sy);
-        for (int t = 0; t < 3; ++t) {
-            disp.drawRect(X1 - t, Y1 - t, (X2 - X1) + 2 * t, (Y2 - Y1) + 2 * t, TFT_GREEN);
-        }
-        disp.setTextSize(2);
-        disp.setTextColor(TFT_BLACK, TFT_GREEN);
-        disp.setCursor(X1, std::max(Y1 - 18, 0));
-        disp.printf(" %.2f ", b.score);
-    }
-    disp.setTextColor(TFT_WHITE, TFT_BLACK);
-    disp.setTextSize(2);
-    disp.setCursor(4, 24);
-    disp.printf(" person: %u  detect %.1f ms ", (unsigned)boxes.size(), det_ms);
-    disp.setRotation(0);
-    disp.endWrite();
-}
-#endif // ENABLE_DETECT
-
-// ---------------------------------------------------------------------------
 // フレーム処理タスク: キューから取り出し → デコード → 描画 → 返却
 // ---------------------------------------------------------------------------
 static void frame_processing_task(void *arg)
@@ -483,9 +361,6 @@ static void frame_processing_task(void *arg)
                 break;
             }
             if (ok) {
-#if ENABLE_DETECT
-                request_detect(s_rgb_buf, w, h);
-#endif
                 draw_frame(s_rgb_buf, w, h);
             }
             uvc_host_frame_return(s_stream, frame);
@@ -546,45 +421,6 @@ static bool select_format(const connected_info_t &info, uvc_host_stream_format_t
     out.format = best.format;
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// 自己診断 (シリアルログで色順と回転方向を確認する)
-// ---------------------------------------------------------------------------
-#if SELF_TEST
-#include "test_jpg.h"   // 160x120: 左半分 赤 / 右半分 青
-static void self_test()
-{
-    int w = 0, h = 0;
-    // HW デコーダはフラッシュ (rodata) を直接読めないので RAM へコピー
-    uint8_t *jpg = (uint8_t *)heap_caps_malloc(sizeof(test_jpg), MALLOC_CAP_SPIRAM);
-    memcpy(jpg, test_jpg, sizeof(test_jpg));
-    if (decode_jpeg(jpg, sizeof(test_jpg), s_rgb_buf, s_rgb_buf_size, w, h)) {
-        const uint16_t *p = (const uint16_t *)s_rgb_buf;
-        ESP_LOGI(TAG, "[selftest] jpeg %dx%d  red-pixel=0x%04X (expect F800)  blue-pixel=0x%04X (expect 001F)",
-                 w, h, p[60 * w + 40], p[60 * w + 120]);
-    } else {
-        ESP_LOGE(TAG, "[selftest] test jpeg decode failed");
-    }
-    free(jpg);
-
-    // 4x2 の入力: in[y][x] = y*16 + x
-    uint16_t *in = (uint16_t *)s_rgb_buf;
-    const int iw = 4, ih = 2;
-    for (int y = 0; y < ih; ++y)
-        for (int x = 0; x < iw; ++x)
-            in[y * iw + x] = (uint16_t)(y * 16 + x);
-    int ow = 0, oh = 0, ox = 0, oy = 0;
-    if (ppa_rotate_scale(s_rgb_buf, iw, ih, 1.0f, s_disp_buf, s_disp_buf_size, ih, iw, ow, oh, ox, oy)) {
-        const uint16_t *o = (const uint16_t *)s_disp_buf;
-        bool ok = true;
-        for (int py = 0; py < oh; ++py)
-            for (int px = 0; px < ow; ++px)
-                if (o[py * ow + px] != in[(ih - 1 - px) * iw + py]) ok = false;   // 期待: 時計回り 90 度
-        ESP_LOGI(TAG, "[selftest] ppa out %dx%d: %02X %02X / %02X %02X / %02X %02X / %02X %02X  -> clockwise90 %s",
-                 ow, oh, o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7], ok ? "OK" : "MISMATCH");
-    }
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // app_main
@@ -648,25 +484,6 @@ extern "C" void app_main(void)
         }
     }
 
-#if SELF_TEST
-    self_test();
-#endif
-
-#if ENABLE_DETECT
-    // 物体検出 (UHD) の初期化
-    s_det_buf = (uint8_t *)heap_caps_aligned_calloc(128, 1, MAX_FRAME_W * MAX_FRAME_H * 2, MALLOC_CAP_SPIRAM);
-    s_det_req_sem = xSemaphoreCreateBinary();
-    s_det_mutex   = xSemaphoreCreateMutex();
-    assert(s_det_buf && s_det_req_sem && s_det_mutex);
-    s_detector = new uhd_detect::UltraLightweightHumanDetect(DETECT_SCORE_THR, DETECT_NMS_THR, DETECT_TOP_K);
-    if (!s_detector->ok()) {
-        ESP_LOGE(TAG, "UHD model init failed, detection disabled");
-        delete s_detector;
-        s_detector = nullptr;
-    } else {
-        xTaskCreatePinnedToCore(detect_task, "detect", 16 * 1024, nullptr, 3, nullptr, 0);
-    }
-#endif
 
     // USB ホスト
     ESP_LOGI(TAG, "Installing USB Host");
